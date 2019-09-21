@@ -4,6 +4,7 @@ import h5py
 import numpy as np
 from progressbar import ProgressBar
 from commons import check_mkdir
+from scipy.optimize import linear_sum_assignment
 
 def load_gt_h5(fn):
     """ Output: pts             B x N x 3   float32
@@ -36,6 +37,21 @@ def load_pred_h5(fn):
         valid = fin['valid'][:]
         conf = fin['conf'][:]
         return mask, label, valid, conf
+
+def load_pred_h5_ins(fn):
+    """ Output: mask    B x K x N   bool
+                label   B x K       uint8
+                valid   B x K       bool
+                conf    B x K       float32
+        We only evaluate on the part predictions with valid = True.
+        We assume no pre-sorting according to confidence score.
+    """
+    with h5py.File(fn, 'r') as fin:
+        mask = fin['mask'][:]
+        valid = fin['valid'][:]
+        conf = fin['conf'][:]
+        return mask, valid, conf
+
 
 def compute_ap(tp, fp, gt_npos, n_bins=100, plot_fn=None):
     assert len(tp) == len(fp), 'ERROR: the length of true_pos and false_pos is not the same!'
@@ -485,4 +501,355 @@ def eval_hier_shape_mean_iou(gt_labels, pred_labels, tree_constraint, tree_paren
             cnt += 1
 
     return tot / cnt
+
+
+def eval_recall_iou_ins(stat_fn, gt_dir, pred_dir, iou_threshold=0.5, plot_dir=None):
+    """ Input:  stat_fn contains all part ids and names
+                gt_dir contains test-xx.h5
+                pred_dir contains test-xx.h5
+        Output: aps: Average Prediction Scores for each part category, evaluated on all test shapes
+                mAP: mean AP
+    """
+    print('Evaluation Start.')
+    print('Ground-truth Directory: %s' % gt_dir)
+    print('Prediction Directory: %s' % pred_dir)
+
+    if plot_dir is not None and not os.path.exists(plot_dir):
+        check_mkdir(plot_dir)
+
+    # read stat_fn
+    with open(stat_fn, 'r') as fin:
+        part_name_list = [item.rstrip().split()[1] for item in fin.readlines()]
+    print('Part Name List: ', part_name_list)
+    n_labels = len(part_name_list)
+    print('Total Number of Semantic Labels: %d' % n_labels)
+
+    # check all h5 files
+    test_h5_list = []
+    for item in os.listdir(gt_dir):
+        if item.startswith('test-') and item.endswith('.h5'):
+            if not os.path.exists(os.path.join(pred_dir, item)):
+                print('ERROR: h5 file %s is in gt directory but not in pred directory.')
+                exit(1)
+            test_h5_list.append(item)
+
+    # read each h5 file and collect per-part-category true_pos, false_pos and confidence scores
+    # true_pos_list = [[] for item in part_name_list]
+    # false_pos_list = [[] for item in part_name_list]
+    # conf_score_list = [[] for item in part_name_list]
+    true_pos_list = []
+    false_pos_list = []
+    conf_score_list = []
+    iou_list = []
+
+    gt_npos = np.zeros((n_labels), dtype=np.int32)
+    gt_ins_num = 0
+
+    for item in test_h5_list:
+        print('Testing %s' % item)
+
+        gt_mask, gt_mask_label, gt_mask_valid, gt_mask_other = load_gt_h5(os.path.join(gt_dir, item))
+        pred_mask, pred_valid, pred_conf = load_pred_h5_ins(os.path.join(pred_dir, item))
+
+        n_shape = gt_mask.shape[0]
+        gt_n_ins = gt_mask.shape[1]
+        pred_n_ins = pred_mask.shape[1]
+
+        for i in range(n_shape):
+            cur_pred_mask = pred_mask[i, ...]
+            cur_pred_conf = pred_conf[i, :]
+            cur_pred_valid = pred_valid[i, :]
+
+            cur_gt_mask = gt_mask[i, ...]
+            cur_gt_valid = gt_mask_valid[i, :]
+            cur_gt_other = gt_mask_other[i, :]
+
+            gt_ins_num += np.sum(cur_gt_valid)
+            ## classify all valid gt masks by part categories
+            # gt_mask_per_cat = [[] for item in part_name_list]
+            # for j in range(gt_n_ins):
+            #    if cur_gt_valid[j]:
+            #        sem_id = cur_gt_label[j]
+            #        gt_mask_per_cat[sem_id].append(j)
+            #        gt_npos[sem_id] += 1
+
+            # sort prediction and match iou to gt masks
+            assert np.sum(cur_gt_mask[np.sum(cur_gt_valid):]) == 0
+            cur_gt_mask = cur_gt_mask[:np.sum(cur_gt_valid)]
+            cur_pred_mask = cur_pred_mask[np.where(cur_pred_valid)]
+            intersect = np.matmul(cur_gt_mask.astype(np.int32), (cur_pred_mask.transpose(1, 0).astype(np.int32)))
+            union = cur_gt_mask.shape[1] - np.matmul(1 - cur_gt_mask.astype(np.int32),
+                                                     1 - (cur_pred_mask.transpose(1, 0).astype(np.int32)))
+            iou = intersect / (union + 1e-6)
+            row, column = linear_sum_assignment(-iou)
+            iou_list += list(iou[row, column])
+            if row.shape[0] < cur_gt_mask.shape[0]:
+                iou_list += list(np.zeros(cur_gt_mask.shape[0] - row.shape[0]))
+
+    iou_arr = np.array(iou_list)
+    recall_iou_list = []
+    xx = np.linspace(0.05, 0.55, 11) - 0.05 + 0.5
+    for i in range(11):
+        p = xx[i]
+        recall_iou_list.append(np.sum(iou_arr >= p) / iou_arr.shape[0])
+    recall_iou_arr = np.array(recall_iou_list)
+
+    if plot_dir is not None:
+        plot_fn = os.path.join(plot_dir, gt_dir.split('/')[-2] + '_realliou' + '.png')
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')
+        plt.switch_backend('agg')
+        fig = plt.figure()
+        plt.plot(xx, recall_iou_arr, 'b-')
+        plt.title('Recall versus IoU (AR: %4.2f%%)' % (np.mean(recall_iou_arr)))
+        plt.xlabel('IoU')
+        plt.ylabel('Recall')
+        plt.xlim([0.5, 1])
+        plt.ylim([0, 1])
+        fig.savefig(plot_fn)
+        plt.close(fig)
+
+    # compute mean AP
+    # mean_ap = np.sum(aps * ap_valids) / np.sum(ap_valids)
+
+    return recall_iou_arr  # , ap_valids, gt_npos, mean_ap
+
+
+def eval_per_class_ap_ins(stat_fn, gt_dir, pred_dir, iou_threshold=0.5, plot_dir=None):
+    """ Input:  stat_fn contains all part ids and names
+                gt_dir contains test-xx.h5
+                pred_dir contains test-xx.h5
+        Output: aps: Average Prediction Scores for each part category, evaluated on all test shapes
+                mAP: mean AP
+    """
+    print('Evaluation Start.')
+    print('Ground-truth Directory: %s' % gt_dir)
+    print('Prediction Directory: %s' % pred_dir)
+
+    if plot_dir is not None and not os.path.exists(plot_dir):
+        check_mkdir(plot_dir)
+
+    # read stat_fn
+    with open(stat_fn, 'r') as fin:
+        part_name_list = [item.rstrip().split()[1] for item in fin.readlines()]
+    print('Part Name List: ', part_name_list)
+    n_labels = len(part_name_list)
+    print('Total Number of Semantic Labels: %d' % n_labels)
+
+    # check all h5 files
+    test_h5_list = []
+    for item in os.listdir(gt_dir):
+        if item.startswith('test-') and item.endswith('.h5'):
+            if not os.path.exists(os.path.join(pred_dir, item)):
+                print('ERROR: h5 file %s is in gt directory but not in pred directory.')
+                exit(1)
+            test_h5_list.append(item)
+
+    # read each h5 file and collect per-part-category true_pos, false_pos and confidence scores
+    # true_pos_list = [[] for item in part_name_list]
+    # false_pos_list = [[] for item in part_name_list]
+    # conf_score_list = [[] for item in part_name_list]
+    true_pos_list = []
+    false_pos_list = []
+    conf_score_list = []
+
+    gt_npos = np.zeros((n_labels), dtype=np.int32)
+    gt_ins_num = 0
+
+    for item in test_h5_list:
+        print('Testing %s' % item)
+
+        gt_mask, gt_mask_label, gt_mask_valid, gt_mask_other = load_gt_h5(os.path.join(gt_dir, item))
+        pred_mask, pred_valid, pred_conf = load_pred_h5_ins(os.path.join(pred_dir, item))
+
+        n_shape = gt_mask.shape[0]
+        gt_n_ins = gt_mask.shape[1]
+        pred_n_ins = pred_mask.shape[1]
+
+        for i in range(n_shape):
+            cur_pred_mask = pred_mask[i, ...]
+            cur_pred_conf = pred_conf[i, :]
+            cur_pred_valid = pred_valid[i, :]
+
+            cur_gt_mask = gt_mask[i, ...]
+            cur_gt_valid = gt_mask_valid[i, :]
+            cur_gt_other = gt_mask_other[i, :]
+
+            gt_ins_num += np.sum(cur_gt_valid)
+
+            # sort prediction and match iou to gt masks
+            cur_pred_conf[~cur_pred_valid] = 0.0
+            order = np.argsort(-cur_pred_conf)
+
+            gt_used = np.zeros((gt_n_ins), dtype=np.bool)
+
+            for j in range(pred_n_ins):
+                idx = order[j]
+                if cur_pred_valid[idx]:
+                    # sem_id = cur_pred_label[idx]
+
+                    iou_max = 0.0;
+                    cor_gt_id = -1;
+                    # for k in gt_mask_per_cat[sem_id]:
+                    for k in range(gt_n_ins):
+                        if not cur_gt_valid[k]:
+                            continue
+                        if not gt_used[k]:
+                            # Remove points with gt label *other* from the prediction
+                            # We will not evaluate them in the IoU since they can be assigned any label
+                            clean_cur_pred_mask = (cur_pred_mask[idx, :] & (~cur_gt_other))
+
+                            intersect = np.sum(cur_gt_mask[k, :] & clean_cur_pred_mask)
+                            union = np.sum(cur_gt_mask[k, :] | clean_cur_pred_mask)
+                            iou = intersect * 1.0 / union
+
+                            if iou > iou_max:
+                                iou_max = iou
+                                cor_gt_id = k
+
+                    if iou_max > iou_threshold:
+                        gt_used[cor_gt_id] = True
+
+                        # add in a true positive
+                        true_pos_list.append(True)
+                        false_pos_list.append(False)
+                        conf_score_list.append(cur_pred_conf[idx])
+                    else:
+                        # add in a false positive
+                        true_pos_list.append(False)
+                        false_pos_list.append(True)
+                        conf_score_list.append(cur_pred_conf[idx])
+
+    cur_true_pos = np.array(true_pos_list, dtype=np.float32)
+    cur_false_pos = np.array(false_pos_list, dtype=np.float32)
+    cur_conf_score = np.array(conf_score_list, dtype=np.float32)
+
+    # sort according to confidence score again
+    order = np.argsort(-cur_conf_score)
+    sorted_true_pos = cur_true_pos[order]
+    sorted_false_pos = cur_false_pos[order]
+    out_plot_fn = None
+    if plot_dir is not None:
+        out_plot_fn = os.path.join(plot_dir, gt_dir.split('/')[-2] + '_ap' + str(iou_threshold) + '.png')
+    aps = compute_ap(sorted_true_pos, sorted_false_pos, gt_ins_num, plot_fn=out_plot_fn)
+
+
+    return aps  # , ap_valids, gt_npos, mean_ap
+
+
+def eval_per_shape_mean_ap_ins(stat_fn, gt_dir, pred_dir, iou_threshold=0.5):
+    """ Input:  stat_fn contains all part ids and names
+                gt_dir contains test-xx.h5
+                pred_dir contains test-xx.h5
+        Output: mean_aps:       per-shape mean aps, which is the mean AP on each test shape,
+                                for each shape, we only consider the parts that exist in either gt or pred
+                shape_valids:   If a shape has valid parts to evaluate or not
+                mean_mean_ap:   mean per-shape mean aps
+    """
+    print('Evaluation Start.')
+    print('Ground-truth Directory: %s' % gt_dir)
+    print('Prediction Directory: %s' % pred_dir)
+
+    # read stat_fn
+    with open(stat_fn, 'r') as fin:
+        part_name_list = [item.rstrip().split()[1] for item in fin.readlines()]
+    print('Part Name List: ', part_name_list)
+    n_labels = len(part_name_list)
+    print('Total Number of Semantic Labels: %d' % n_labels)
+
+    # check all h5 files
+    test_h5_list = []
+    for item in os.listdir(gt_dir):
+        if item.startswith('test-') and item.endswith('.h5'):
+            if not os.path.exists(os.path.join(pred_dir, item)):
+                print('ERROR: h5 file %s is in gt directory but not in pred directory.')
+                exit(1)
+            test_h5_list.append(item)
+
+    mean_aps = []
+    shape_valids = []
+
+    # read each h5 file
+    for item in test_h5_list:
+        print('Testing %s' % item)
+
+        gt_mask, gt_mask_label, gt_mask_valid, gt_mask_other = load_gt_h5(os.path.join(gt_dir, item))
+        pred_mask, pred_valid, pred_conf = load_pred_h5_ins(os.path.join(pred_dir, item))
+
+        n_shape = gt_mask.shape[0]
+        gt_n_ins = gt_mask.shape[1]
+        pred_n_ins = pred_mask.shape[1]
+
+        for i in range(n_shape):
+            cur_pred_mask = pred_mask[i, ...]
+            cur_pred_conf = pred_conf[i, :]
+            cur_pred_valid = pred_valid[i, :]
+
+            cur_gt_mask = gt_mask[i, ...]
+            cur_gt_valid = gt_mask_valid[i, :]
+            cur_gt_other = gt_mask_other[i, :]
+
+            true_pos_list = []
+            false_pos_list = []
+            gt_ins_num = np.sum(cur_gt_valid)
+
+            # sort prediction and match iou to gt masks
+            cur_pred_conf[~cur_pred_valid] = 0.0
+            order = np.argsort(-cur_pred_conf)
+
+            gt_used = np.zeros((gt_n_ins), dtype=np.bool)
+
+            # enumerate all pred parts
+            for j in range(pred_n_ins):
+                idx = order[j]
+                if cur_pred_valid[idx]:
+                    # sem_id = cur_pred_label[idx]
+
+                    iou_max = 0.0;
+                    cor_gt_id = -1;
+                    for k in range(gt_n_ins):
+                        # for k in gt_mask_per_cat[sem_id]:
+                        if not cur_gt_valid[k]:
+                            continue
+                        if not gt_used[k]:
+                            # Remove points with gt label *other* from the prediction
+                            # We will not evaluate them in the IoU since they can be assigned any label
+                            clean_cur_pred_mask = (cur_pred_mask[idx, :] & (~cur_gt_other))
+
+                            intersect = np.sum(cur_gt_mask[k, :] & clean_cur_pred_mask)
+                            union = np.sum(cur_gt_mask[k, :] | clean_cur_pred_mask)
+                            iou = intersect * 1.0 / union
+
+                            if iou > iou_max:
+                                iou_max = iou
+                                cor_gt_id = k
+
+                    if iou_max > iou_threshold:
+                        gt_used[cor_gt_id] = True
+
+                        # add in a true positive
+                        true_pos_list.append(True)
+                        false_pos_list.append(False)
+                    else:
+                        # add in a false positive
+                        true_pos_list.append(False)
+                        false_pos_list.append(True)
+
+            if gt_ins_num > 0:
+                cur_true_pos = np.array(true_pos_list, dtype=np.float32)
+                cur_false_pos = np.array(false_pos_list, dtype=np.float32)
+                mean_aps.append(compute_ap(cur_true_pos, cur_false_pos, gt_ins_num))
+                shape_valids.append(True)
+            else:
+                mean_aps.append(0.0)
+                shape_valids.append(False)
+
+    # compute mean mean AP
+    mean_aps = np.array(mean_aps, dtype=np.float32)
+    shape_valids = np.array(shape_valids, dtype=np.bool)
+
+    mean_mean_ap = np.sum(mean_aps * shape_valids) / np.sum(shape_valids)
+
+    return mean_aps, mean_mean_ap  # shape_valids, mean_mean_ap
 
