@@ -25,7 +25,7 @@ parser.add_argument('--model', type=str, default='model', help='Model name [defa
 parser.add_argument('--category', type=str, default='Chair', help='Category name [default: Chair]')
 parser.add_argument('--level_id', type=int, default='3', help='Level ID [default: 3]')
 parser.add_argument('--num_ins', type=int, default='200', help='Max Number of Instance [default: 200]')
-parser.add_argument('--log_dir', type=str, default='log', nargs='+', help='Log dir [default: log]')
+parser.add_argument('--log_dir', type=str, default='log', help='Log dir [default: log]')
 parser.add_argument('--valid_dir', type=str, default='valid', help='Valid dir [default: valid]')
 parser.add_argument('--eval_dir', type=str, default='eval', help='Eval dir [default: eval]')
 parser.add_argument('--pred_dir', type=str, default='pred', help='Pred dir [default: pred]')
@@ -42,8 +42,56 @@ GPU_INDEX = FLAGS.gpu
 
 MODEL = importlib.import_module(FLAGS.model) # import network module
 MODEL_FILE = os.path.join(ROOT_DIR, 'models', FLAGS.model+'.py')
+LOG_DIR = FLAGS.log_dir
+CKPT_DIR = os.path.join(LOG_DIR, 'trained_models')
+if not os.path.exists(LOG_DIR):
+    print('ERROR: log_dir %s does not exist! Please Check!' % LOG_DIR)
+    exit(1)
+VALID_DIR = os.path.join(LOG_DIR, FLAGS.valid_dir)
+if not os.path.exists(VALID_DIR):
+    print('ERROR: valid_dir %s does not exist! Run valid.py first!' % VALID_DIR)
+    exit(1)
+LOG_DIR = os.path.join(LOG_DIR, FLAGS.eval_dir)
+check_mkdir(LOG_DIR)
+PRED_DIR = os.path.join(LOG_DIR, FLAGS.pred_dir)
+force_mkdir(PRED_DIR)
+if FLAGS.visu_dir is not None:
+    VISU_DIR = os.path.join(LOG_DIR, FLAGS.visu_dir)
+    force_mkdir(VISU_DIR)
 
-def log_string(out_str, LOG_FOUT):
+os.system('cp %s %s' % (MODEL_FILE, LOG_DIR)) # bkp of model def
+os.system('cp %s %s' % (__file__, LOG_DIR)) # bkp of train procedure
+LOG_FOUT = open(os.path.join(LOG_DIR, 'log_eval.txt'), 'w')
+LOG_FOUT.write(str(FLAGS)+'\n')
+
+# load meta data files
+stat_in_fn = '../../stats/after_merging_label_ids/%s-level-%d.txt' % (FLAGS.category, FLAGS.level_id)
+print('Reading from ', stat_in_fn)
+with open(stat_in_fn, 'r') as fin:
+    part_name_list = [item.rstrip().split()[1] for item in fin.readlines()]
+print('Part Name List: ', part_name_list)
+data_in_dir = '../../data/ins_seg_h5_for_sgpn/%s-%d/' % (FLAGS.category, FLAGS.level_id)
+test_h5_fn_list = []
+for item in os.listdir(data_in_dir):
+    if item.endswith('.h5') and item.startswith('test-'):
+        test_h5_fn_list.append(item)
+
+NUM_CLASSES = len(part_name_list)
+print('Semantic Labels: ', NUM_CLASSES)
+NUM_CLASSES = 1
+print('force Semantic Labels: ', NUM_CLASSES)
+NUM_INS = FLAGS.num_ins
+print('Number of Instances: ', NUM_INS)
+
+# load validiation hyper-parameters
+pw_sim_thres = np.loadtxt(os.path.join(VALID_DIR, 'per_category_pointwise_similarity_threshold.txt')).reshape(NUM_CLASSES)
+avg_group_size = np.loadtxt(os.path.join(VALID_DIR, 'per_category_average_group_size.txt')).reshape(NUM_CLASSES)
+min_group_size = 0.25 * avg_group_size
+
+for i in range(NUM_CLASSES):
+    print('%d %s %f %d' % (i, part_name_list[i], pw_sim_thres[i], min_group_size[i]))
+
+def log_string(out_str):
     LOG_FOUT.write(out_str+'\n')
     LOG_FOUT.flush()
     print(out_str)
@@ -162,7 +210,7 @@ def render_pts_with_mask_pptk(out, pts, mask, delete_img=False, base=0, point_si
     export_pts(tmp_pts, pts)
     export_label(tmp_label, mask)
 
-def gen_visu(base_idx, pts, mask, valid, conf, record, VISU_DIR, num_pts_to_visu=1000):
+def gen_visu(base_idx, pts, mask, valid, conf, record, num_pts_to_visu=1000):
     n_shape = pts.shape[0]
     n_ins = mask.shape[1]
     
@@ -215,7 +263,7 @@ def gen_visu(base_idx, pts, mask, valid, conf, record, VISU_DIR, num_pts_to_visu
                     fout.write('#pts: %d\n' % np.sum(cur_mask[cur_idx, :]))
 
 
-def eval(NUM_POINT, NUM_INS, NUM_CLASSES, CKPT_DIR, test_h5_fn_list, min_group_size, pw_sim_thres, PRED_DIR, VISU_DIR, LOG_FOUT):
+def eval():
     with tf.Graph().as_default():
         with tf.device('/gpu:'+str(GPU_INDEX)):
             pointclouds_ph, _, _, _, _, _ = MODEL.placeholder_inputs(BATCH_SIZE, NUM_POINT, NUM_INS, NUM_CLASSES)   # B x N x 3
@@ -240,9 +288,9 @@ def eval(NUM_POINT, NUM_INS, NUM_CLASSES, CKPT_DIR, test_h5_fn_list, min_group_s
         if ckptstate is not None:
             LOAD_MODEL_FILE = os.path.join(CKPT_DIR, os.path.basename(ckptstate.model_checkpoint_path))
             loader.restore(sess, LOAD_MODEL_FILE)
-            log_string("Model loaded in file: %s" % LOAD_MODEL_FILE, LOG_FOUT)
+            log_string("Model loaded in file: %s" % LOAD_MODEL_FILE)
         else:
-            log_string("Fail to load modelfile: %s" % CKPT_DIR, LOG_FOUT)
+            log_string("Fail to load modelfile: %s" % CKPT_DIR)
 
         # visu
         if FLAGS.visu_dir is not None:
@@ -252,9 +300,8 @@ def eval(NUM_POINT, NUM_INS, NUM_CLASSES, CKPT_DIR, test_h5_fn_list, min_group_s
         batch_pts = np.zeros((BATCH_SIZE, NUM_POINT, 3), dtype=np.float32)
 
         for item in test_h5_fn_list:
-            # cur_h5_fn = os.path.join(data_in_dir, item)
-            # print('Reading data from ', cur_h5_fn)
-            cur_h5_fn = item
+            cur_h5_fn = os.path.join(data_in_dir, item)
+            print('Reading data from ', cur_h5_fn)
             pts, record = load_data(cur_h5_fn)
 
             n_shape = pts.shape[0]
@@ -296,66 +343,18 @@ def eval(NUM_POINT, NUM_INS, NUM_CLASSES, CKPT_DIR, test_h5_fn_list, min_group_s
 
                 if FLAGS.visu_dir is not None and cur_visu_batch < FLAGS.visu_batch:
                     gen_visu(start_idx, batch_pts[:end_idx-start_idx, ...], out_mask[start_idx: end_idx, ...], out_valid[start_idx: end_idx, :], \
-                            out_conf[start_idx: end_idx, :], batch_record, VISU_DIR)
+                            out_conf[start_idx: end_idx, :], batch_record)
                     cur_visu_batch += 1
 
-            save_h5(os.path.join(PRED_DIR, os.path.basename(item)), out_mask, out_valid, out_conf)
+            save_h5(os.path.join(PRED_DIR, item), out_mask, out_valid, out_conf)
 
-        # if FLAGS.visu_dir is not None:
-        #     cmd = 'cd %s && python %s . 1 htmls pts,info:pred,info pts,info:pred,info' % (VISU_DIR, os.path.join(ROOT_DIR, '../utils/gen_html_hierachy_local.py'))
-        #     log_string(cmd, LOG_FOUT)
-        #     call(cmd, shell=True)
-
-
-def main():
-    for LOG_DIR in FLAGS.log_dir:
-        CKPT_DIR = os.path.join(LOG_DIR, 'trained_models')
-        if not os.path.exists(LOG_DIR):
-            print('ERROR: log_dir %s does not exist! Please Check!' % LOG_DIR)
-            exit(1)
-        VALID_DIR = os.path.join(LOG_DIR, FLAGS.valid_dir)
-        if not os.path.exists(VALID_DIR):
-            print('ERROR: valid_dir %s does not exist! Run valid.py first!' % VALID_DIR)
-            exit(1)
-        LOG_DIR = os.path.join(LOG_DIR, FLAGS.eval_dir)
-        check_mkdir(LOG_DIR)
-        PRED_DIR = os.path.join(LOG_DIR, FLAGS.pred_dir)
-        force_mkdir(PRED_DIR)
         if FLAGS.visu_dir is not None:
-            VISU_DIR = os.path.join(LOG_DIR, FLAGS.visu_dir)
-            force_mkdir(VISU_DIR)
+            cmd = 'cd %s && python %s . 1 htmls pts,info:pred,info pts,info:pred,info' % (VISU_DIR, os.path.join(ROOT_DIR, '../utils/gen_html_hierachy_local.py'))
+            log_string(cmd)
+            call(cmd, shell=True)
 
-        os.system('cp %s %s' % (MODEL_FILE, LOG_DIR)) # bkp of model def
-        os.system('cp %s %s' % (__file__, LOG_DIR)) # bkp of train procedure
-        LOG_FOUT = open(os.path.join(LOG_DIR, 'log_eval.txt'), 'w')
-        LOG_FOUT.write(str(FLAGS)+'\n')
+# main
+log_string('pid: %s'%(str(os.getpid())))
+eval()
+LOG_FOUT.close()
 
-        data_in_dir = '../../data/ins_seg_h5_for_sgpn/%s-%d/' % (FLAGS.category, FLAGS.level_id)
-        test_h5_fn_list = []
-        for item in os.listdir(data_in_dir):
-            if item.endswith('.h5') and item.startswith('test-'):
-                test_h5_fn_list.append(os.path.join(data_in_dir, item))
-
-        NUM_CLASSES = 1
-        print('force Semantic Labels: ', NUM_CLASSES)
-        NUM_INS = FLAGS.num_ins
-        print('Number of Instances: ', NUM_INS)
-
-        # load validiation hyper-parameters
-        pw_sim_thres = np.loadtxt(os.path.join(VALID_DIR, 'per_category_pointwise_similarity_threshold.txt')).reshape(NUM_CLASSES)
-        avg_group_size = np.loadtxt(os.path.join(VALID_DIR, 'per_category_average_group_size.txt')).reshape(NUM_CLASSES)
-        min_group_size = 0.25 * avg_group_size
-
-        for i in range(NUM_CLASSES):
-            print('%d %f %d' % (i, pw_sim_thres[i], min_group_size[i]))
-
-        # main
-        log_string('pid: %s'%(str(os.getpid())), LOG_FOUT)
-        eval(NUM_CLASSES=NUM_CLASSES, NUM_POINT=NUM_POINT, NUM_INS=NUM_INS, CKPT_DIR=CKPT_DIR,
-             test_h5_fn_list=test_h5_fn_list, min_group_size=min_group_size, pw_sim_thres=pw_sim_thres,
-             PRED_DIR=PRED_DIR, VISU_DIR=VISU_DIR, LOG_FOUT=LOG_FOUT)
-        LOG_FOUT.close()
-
-
-if __name__ == '__main__':
-    main()
